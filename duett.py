@@ -1,3 +1,4 @@
+from itertools import islice
 import torch
 import torchmetrics
 import torch.nn.functional as F
@@ -51,8 +52,9 @@ class Model(pl.LightningModule):
             pretrain=True, pretrain_masked_steps=1, pretrain_n_hidden=0, pretrain_d_hidden=64, pretrain_dropout=0.5,
             pretrain_value=True, pretrain_presence=True, pretrain_presence_weight=0.2, predict_events=True,
             transformer_dropout=0., pos_frac=None, freeze_encoder=False, seed=0, save_representation=None,
-            masked_transform_timesteps=32, **kwargs):
+            masked_transform_timesteps=32, mode='default', **kwargs):
         super().__init__()
+        self.d_static_num = d_static_num
         self.lr = lr
         self.weight_decay = weight_decay
         self.d_time_series_num = d_time_series_num
@@ -76,6 +78,7 @@ class Model(pl.LightningModule):
         self.save_representation = save_representation
         self.register_buffer("MASKED_EMBEDDING_KEY", torch.tensor(0)) # For multi-gpu training
         self.register_buffer("REPRESENTATION_EMBEDDING_KEY", torch.tensor(1))
+        self.mode = mode
 
         # For any special timesteps, e.g., masked, static, [CLS], etc.
         self.special_embeddings = nn.Embedding(8, d_embedding)
@@ -236,6 +239,8 @@ class Model(pl.LightningModule):
         :return: prediction output (i.e., class probabilities vector)
         """
         xs_static, xs_feats, xs_times, n_timesteps = x
+        # from torchinfo import summary
+        # summary(self, input_size=(xs_feats.shape[1], xs_feats.shape[2]))
         n_vars = xs_feats.shape[2] // 2
         if self.predict_events:
             event_mask_inds = xs_feats[:,:,n_vars:n_vars*2] == -1
@@ -314,6 +319,153 @@ class Model(pl.LightningModule):
             return out, z
         else:
             return out
+
+
+    def forward_interp(self, x, pretrain=False, representation=False):
+        """
+        Forward run
+        :param x: input to the model
+        :return: prediction output (i.e., class probabilities vector)
+        """
+        xs_static, xs_feats, xs_times, n_timesteps = x
+        # from torchinfo import summary
+        # summary(self, input_size=(xs_feats.shape[1], xs_feats.shape[2]))
+        n_vars = xs_feats.shape[2] // 2
+        if self.predict_events:
+            event_mask_inds = xs_feats[:,:,n_vars:n_vars*2] == -1
+            event_mask_inds = torch.cat((event_mask_inds, torch.zeros(xs_feats.shape[:2] + (1,), device=xs_feats.device, dtype=torch.bool)), dim=2)
+            event_mask_inds = torch.cat((event_mask_inds, event_mask_inds[:,:1,:]), dim=1)
+        n_obs_inds = xs_feats[:,:,n_vars:n_vars*2].to(int).clip(0, self.n_obs_embedding.num_embeddings - 1)
+        xs_feats[:,:,n_vars:n_vars*2] = self.n_obs_embedding(n_obs_inds).squeeze(-1)
+
+        embedding_layer_input = torch.empty(xs_feats.shape[:-1] + (n_vars, 2), dtype=xs_feats.dtype, device=xs_feats.device)
+        embedding_layer_input[:,:,:,0] = xs_feats[:,:,:n_vars]
+        embedding_layer_input[:,:,:,1] = xs_feats[:,:,n_vars:n_vars*2]
+        # dims: batch, time step, var, embedding
+        psi = torch.zeros((xs_feats.shape[0], xs_feats.shape[1]+1, n_vars+1, self.d_embedding), dtype=xs_feats.dtype, device=xs_feats.device)
+        for i, el in enumerate(self.embedding_layers):
+            psi[:,:-1,i,:] = el(embedding_layer_input[:,:,i,:])
+        psi[:,:-1,-1,:] = self.tab_encoder(xs_static).unsqueeze(1)
+        psi[:,-1,:,:] = self.special_embeddings(self.REPRESENTATION_EMBEDDING_KEY.to(self.device)).unsqueeze(0).unsqueeze(1)
+        mask_inds = torch.cat((xs_feats[:,:,-1] == 1, torch.zeros((xs_feats.shape[0], 1), device=xs_feats.device, dtype=torch.bool)), dim=1)
+        psi[mask_inds, :, :] = self.special_embeddings(self.MASKED_EMBEDDING_KEY.to(self.device))
+        if self.predict_events:
+            psi[event_mask_inds, :] = self.special_embeddings(self.MASKED_EMBEDDING_KEY.to(self.device))
+
+        # batch, time step, full embedding
+        time_embeddings = self.full_time_embedding(xs_times.unsqueeze(2))
+        time_embeddings = torch.cat((time_embeddings,
+            self.full_rep_embedding.weight.T.unsqueeze(0).expand(xs_feats.shape[0],-1,-1)),
+            dim=1)
+        for layer_i, (event_transformer, time_transformer) in islice(
+                enumerate(zip(self.event_transformers, self.time_transformers)), 1):
+            et_out_shape = (psi.shape[0], psi.shape[2], psi.shape[1], psi.shape[3])
+            embeddings = psi.transpose(1,2).flatten(2) + self.full_event_embedding.weight.unsqueeze(0)
+            event_outs = event_transformer(embeddings).view(et_out_shape).transpose(1,2)
+            tt_out_shape = event_outs.shape
+            embeddings = event_outs.flatten(2) + time_embeddings
+            psi = time_transformer(embeddings).view(tt_out_shape)
+        transformed = psi.flatten(2)
+
+        if self.fusion_method == 'rep_token':
+            z_ts = transformed[:,-1,:]
+        elif self.fusion_method == 'masked_embed':
+            if self.pretrain_masked_steps > 1:
+                masked_ind = F.pad(xs_feats[:,:,-1] > 0, (0,1), value=False)
+                z_ts = []
+                for i in range(transformed.shape[0]):
+                    z_ts.append(F.pad(transformed[i, masked_ind[i],:], (0,0,0,self.pretrain_masked_steps-masked_ind[i].sum()), value=0.))
+                z_ts = torch.stack(z_ts) # batch size x pretrain_masked_steps x d_embedding
+            else:
+                masked_ind = xs_feats[:,:,-1:]
+                z_ts = []
+                for i in range(transformed.shape[0]):
+                    z_ts.append(transformed[i, torch.nonzero(masked_ind[i].squeeze()==1),:])
+                z_ts = torch.cat(z_ts, dim=0).squeeze()
+        elif self.fusion_method == 'averaging':
+            z_ts = torch.mean(transformed[:,:-1,:], dim=1)
+
+        z = z_ts
+        if representation:
+            return z
+
+        if pretrain:
+            rep_token_head = torch.tile(transformed[:,0,:].unsqueeze(1), (1, self.masked_transform_timesteps, 1))
+            y_hat_presence = self.pretrain_presence_proj(z).squeeze() if self.pretrain_presence else None
+            y_hat_value = self.pretrain_value_proj(z).squeeze(1) if self.pretrain_value else None
+            z_events = []
+            y_hat_events, y_hat_events_presence = None, None
+            if self.predict_events:
+                for i in range(event_mask_inds.shape[0]):
+                    z_events.append(psi[i][event_mask_inds[i].nonzero(as_tuple=True)].flatten())
+                z_events = torch.stack(z_events)
+                y_hat_events = self.predict_events_proj(z_events).squeeze()
+                y_hat_events_presence = self.predict_events_presence_proj(z_events).squeeze() if self.pretrain_presence else None
+            return y_hat_value, y_hat_presence, y_hat_events, y_hat_events_presence
+
+        out = self.head(z).squeeze(1)
+
+        if self.save_representation:
+            return out, z
+        else:
+            return out
+
+    # def forward_interp(self, x):
+    #     """
+    #     Forward run with some modifications to the model. Used for interpretation.
+    #     :param x: input to the model
+    #     :return: prediction output (i.e., class probabilities vector)
+    #     """
+    #     xs_static, xs_feats, xs_times, _ = x
+    #     n_vars = xs_feats.shape[2] // 2
+    #     if self.predict_events:
+    #         event_mask_inds = xs_feats[:,:,n_vars:n_vars*2] == -1
+    #         event_mask_inds = torch.cat((event_mask_inds, torch.zeros(xs_feats.shape[:2] + (1,), device=xs_feats.device, dtype=torch.bool)), dim=2)
+    #         event_mask_inds = torch.cat((event_mask_inds, event_mask_inds[:,:1,:]), dim=1)
+    #     n_obs_inds = xs_feats[:,:,n_vars:n_vars*2].to(int).clip(0, self.n_obs_embedding.num_embeddings - 1)
+    #     xs_feats[:,:,n_vars:n_vars*2] = self.n_obs_embedding(n_obs_inds).squeeze(-1)
+
+    #     embedding_layer_input = torch.empty(xs_feats.shape[:-1] + (n_vars, 2), dtype=xs_feats.dtype, device=xs_feats.device)
+    #     embedding_layer_input[:,:,:,0] = xs_feats[:,:,:n_vars]
+    #     embedding_layer_input[:,:,:,1] = xs_feats[:,:,n_vars:n_vars*2]
+    #     # dims: batch, time step, var, embedding
+    #     psi = torch.zeros((xs_feats.shape[0], xs_feats.shape[1]+1, n_vars+1, self.d_embedding), dtype=xs_feats.dtype, device=xs_feats.device)
+    #     for i, el in enumerate(self.embedding_layers):
+    #         psi[:,:-1,i,:] = el(embedding_layer_input[:,:,i,:])
+    #     psi[:,:-1,-1,:] = self.tab_encoder(xs_static).unsqueeze(1)
+    #     psi[:,-1,:,:] = self.special_embeddings(self.REPRESENTATION_EMBEDDING_KEY.to(self.device)).unsqueeze(0).unsqueeze(1)
+    #     mask_inds = torch.cat((xs_feats[:,:,-1] == 1, torch.zeros((xs_feats.shape[0], 1), device=xs_feats.device, dtype=torch.bool)), dim=1)
+    #     psi[mask_inds, :, :] = self.special_embeddings(self.MASKED_EMBEDDING_KEY.to(self.device))
+    #     if self.predict_events:
+    #         psi[event_mask_inds, :] = self.special_embeddings(self.MASKED_EMBEDDING_KEY.to(self.device))
+
+    #     # batch, time step, full embedding
+    #     time_embeddings = self.full_time_embedding(xs_times.unsqueeze(2))
+    #     time_embeddings = torch.cat((time_embeddings,
+    #         self.full_rep_embedding.weight.T.unsqueeze(0).expand(xs_feats.shape[0],-1,-1)),
+    #         dim=1)
+    #     for layer_i, (event_transformer, time_transformer) in islice(
+    #             enumerate(zip(self.event_transformers, self.time_transformers)), 1):
+    #         et_out_shape = (psi.shape[0], psi.shape[2], psi.shape[1], psi.shape[3])
+    #         embeddings = psi.transpose(1,2).flatten(2) + self.full_event_embedding.weight.unsqueeze(0)
+    #         event_outs = event_transformer(embeddings).view(et_out_shape).transpose(1,2)
+    #         tt_out_shape = event_outs.shape
+    #         embeddings = event_outs.flatten(2) + time_embeddings
+    #         psi = time_transformer(embeddings).view(tt_out_shape)
+    #     transformed = psi.flatten(2)
+
+    #     masked_ind = xs_feats[:,:,-1:]
+    #     z_ts = []
+    #     for i in range(transformed.shape[0]):
+    #         z_ts.append(transformed[i, torch.nonzero(masked_ind[i].squeeze()==1),:])
+    #     import pdb; pdb.set_trace()
+    #     z_ts = torch.cat(z_ts, dim=0).squeeze()
+
+    #     z = z_ts
+
+    #     out = self.head(z).squeeze(1)
+
+    #     return out
 
     def configure_optimizers(self):
         optimizers = [torch.optim.AdamW([p for l in self.modules() for p in l.parameters()],
@@ -420,7 +572,7 @@ class Model(pl.LightningModule):
         if not self.pretrain:
             print("val_auroc", self.val_auroc.compute(), "val_ap", self.val_ap.compute())
 
-    def test_step(self, batch, batch_idx):
+    def test_step_default(self, batch, batch_idx):
         x, y = batch
         y = torch.tensor(y, dtype=torch.float64, device=self.device)
         batch_size = y.shape[0]
@@ -447,6 +599,28 @@ class Model(pl.LightningModule):
         self.log('test_ap', self.test_ap, on_epoch=True, sync_dist=True, rank_zero_only=True)
 
         return loss, self.test_auroc, self.test_ap
+
+    def test_step_interp(self, batch, batch_idx):
+        x, y = batch
+        y = torch.tensor(y, dtype=torch.float64, device=self.device)
+        batch_size = y.shape[0]
+        y_hat = self.forward_interp(self.feats_to_input(x, batch_size))
+        loss = self.loss_function(y_hat, y)
+        self.log('test_loss', loss, on_epoch=True, sync_dist=True, rank_zero_only=True)
+        self.test_auroc.update(y_hat, y.to(int).to(self.device))
+        self.log('test_auroc', self.test_auroc, on_epoch=True, sync_dist=True, rank_zero_only=True)
+        self.test_ap.update(y_hat, y.to(int).to(self.device))
+        self.log('test_ap', self.test_ap, on_epoch=True, sync_dist=True, rank_zero_only=True)
+
+        return loss, self.test_auroc, self.test_ap
+
+    def test_step(self, batch, batch_idx):
+        if self.mode=='default':
+            return self.test_step_default(batch, batch_idx)
+        elif self.mode=='interp':
+            return self.test_step_interp(batch, batch_idx)
+        else:
+            raise ValueError('Invalid mode')
 
     def on_load_checkpoint(self, checkpoint):
         # Ignore errors from size mismatches in head, since those might change between pretraining
