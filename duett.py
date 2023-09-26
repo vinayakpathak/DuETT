@@ -155,13 +155,19 @@ class Model(pl.LightningModule):
     def feats_to_input(self, x, batch_size, limits=None):
         xs_ts, xs_static, times = x
         xs_ts = list(xs_ts)
+        # len(xs_ts) = batch_size
+        # xs_ts[i].shape = (n_timesteps, n_vars) = (32, 72) during testing
+        # actually n_vars = 72//2
 
         for i,f in enumerate(xs_ts):
             n_vars = f.shape[1] // 2
-            if f.shape[0] > self.max_len:
+            if f.shape[0] > self.max_len: # self.max_len = 48
                 f = f[-self.max_len:]
                 times[i] = times[i][-self.max_len:]
             # Aug
+            # self.training = False during testing
+            # self.aug_noise = 0.0 during testing
+            # self.pretrain = True during testing. Should it be?
             if self.training and self.aug_noise > 0 and not self.pretrain:
                 f[:,:n_vars] += self.aug_noise * torch.randn_like(f[:,:n_vars]) * f[:,n_vars:]
             f = torch.cat((f, torch.zeros_like(f[:,:1])), dim=1)
@@ -180,6 +186,7 @@ class Model(pl.LightningModule):
         if self.training and self.aug_noise > 0 and not self.pretrain:
             xs_static += self.aug_noise * torch.randn_like(xs_static)
 
+        # Not sure why the order of xs_static and xs_ts is reversed here
         return xs_static, xs_ts, xs_times, n_timesteps
 
     def pretrain_prep_batch(self, x, batch_size):
@@ -367,24 +374,7 @@ class Model(pl.LightningModule):
             psi = time_transformer(embeddings).view(tt_out_shape)
         transformed = psi.flatten(2)
 
-        if self.fusion_method == 'rep_token':
-            z_ts = transformed[:,-1,:]
-        elif self.fusion_method == 'masked_embed':
-            if self.pretrain_masked_steps > 1:
-                masked_ind = F.pad(xs_feats[:,:,-1] > 0, (0,1), value=False)
-                z_ts = []
-                for i in range(transformed.shape[0]):
-                    z_ts.append(F.pad(transformed[i, masked_ind[i],:], (0,0,0,self.pretrain_masked_steps-masked_ind[i].sum()), value=0.))
-                z_ts = torch.stack(z_ts) # batch size x pretrain_masked_steps x d_embedding
-            else:
-                masked_ind = xs_feats[:,:,-1:]
-                z_ts = []
-                for i in range(transformed.shape[0]):
-                    z_ts.append(transformed[i, torch.nonzero(masked_ind[i].squeeze()==1),:])
-                z_ts = torch.cat(z_ts, dim=0).squeeze()
-        elif self.fusion_method == 'averaging':
-            z_ts = torch.mean(transformed[:,:-1,:], dim=1)
-
+        z_ts = transformed[:,-1,:]
         z = z_ts
         if representation:
             return z
@@ -602,9 +592,17 @@ class Model(pl.LightningModule):
 
     def test_step_interp(self, batch, batch_idx):
         x, y = batch
+        # x is a strange type. It is a zip class and if we convert it to a
+        # list, it has length 3. Each element of the list is a 512-sized tuple.
+        # So basically each list contains one thing for each item in the batch.
+        # And the batch is of size 512. And there are three kinds of things
+        # within x. Generally one expects the first dimension to be the batch
+        # dimension, but x is weird. It is created by lighning, so it follow's
+        # their convention I assume.
         y = torch.tensor(y, dtype=torch.float64, device=self.device)
         batch_size = y.shape[0]
-        y_hat = self.forward_interp(self.feats_to_input(x, batch_size))
+        x_input = self.feats_to_input(x, batch_size)
+        y_hat = self.forward_interp(x_input)
         loss = self.loss_function(y_hat, y)
         self.log('test_loss', loss, on_epoch=True, sync_dist=True, rank_zero_only=True)
         self.test_auroc.update(y_hat, y.to(int).to(self.device))
